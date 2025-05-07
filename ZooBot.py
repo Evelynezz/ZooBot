@@ -9,11 +9,12 @@ from datetime import datetime, timedelta
 
 from shop import inspector_phrases
 from config import BOT_TOKEN
-from shop import animals, food
+from shop import animals, food, EVENTS
 import asyncio
 import os
 import csv
 import random
+import sqlite3
 
 animals = animals  # словарь с животными
 food = food  # словарь с кормом
@@ -24,19 +25,32 @@ INCOME_TIMER = 1 * 60 # периодичность дохода в секунд�
 PRICE_EFFECT = 0.03  # базовое влияние цены билета на посетителей
 ANIMALS_PER_PAGE = 5  # сколько кнопок с животными выводится на странице зоомагазина
 
-FEEDING_INTERVAL = 10 * 60  # интервал кормления (В СЕКУНДАХ!) # для тестирования установлено 10 минут
-INSPECTION_INTERVAL = 1 * 60  # интервал проверки инспектором (В СЕКУНДАХ) # для тестирования установлена 1 минута
+FEEDING_INTERVAL = 20 * 60  # интервал кормления (В СЕКУНДАХ!)
+INSPECTION_INTERVAL = 10 * 60  # интервал проверки инспектором (В СЕКУНДАХ)
 
 MAX_WARNINGS = 3
+RANDOM_EVENTS_INTERVAL = 60  # интервал случайных событий (В СЕКУНДАХ)
 
 """ДОБАВИТЬ
-*Ограничение на покупку животных игрокам с низкой репутацией
-*Добавить параметр 'Минимальная допустимая репутация' каждому животному
+*Ограничение на покупку животных игрокам с низкой репутацией ☑️
+*Добавить параметр 'Минимальная допустимая репутация' каждому животному ☑️
+*Лимит животных 1 вида (доп. параметр у каждого игрока) ☑️
+*Справочник по репутации /reputation
 """
 
 """ИЗМЕНИТЬ
 *Время кормления и визита Инспектора на почасовое (!ПРОТЕСТИРОВАТЬ!)
-*Ограничить функцию кормления (игрок не может кормить животных каждую минуту)"""
+*Ограничить функцию кормления (игрок не может кормить животных каждую минуту)☑️
+"""
+
+"""Доп.функции
+*СЛУЧАЙНЫЕ СОБЫТИЯ☑️
+*РАСШИРЕНИЕ ЗООПАРКА (+ лимит животных) 
+*ПЕРСОНАЛ
+*СИСТЕМА УРОВНЕЙ
+"""
+
+
 
 
 #  настройки базы данных
@@ -51,95 +65,100 @@ DEFAULT_PLAYER = {
     'warnings': 0,
     'reputation': 100,
     'optimal_price': 30,
-    'base_visitors': 30
+    'base_visitors': 30,
+    'max_animals': 5  #  максимум животных одного вида
 }
 
-inspector_phrases = inspector_phrases
 ###################
 
-"""СОЗДАНИЕ CSV"""
-def init_csv():
-    if not os.path.exists(CSV_FILE):  #  если csv еще не создан
-        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['user_id'] + list(DEFAULT_PLAYER.keys()))
-            writer.writeheader()
+def get_db():
+    conn = sqlite3.connect('zoo_bot.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+"""СОЗДАНИЕ DB"""  #  на случай удаления старой
+def init_db():
+    with get_db() as db:
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            user_id INTEGER PRIMARY KEY,
+            money INTEGER DEFAULT 100,
+            ticket_price INTEGER DEFAULT 10,
+            feed INTEGER DEFAULT 10,
+            animals TEXT DEFAULT '{"кот": 1}',
+            last_income TEXT DEFAULT CURRENT_TIMESTAMP,
+            last_fed TEXT DEFAULT CURRENT_TIMESTAMP,
+            warnings INTEGER DEFAULT 0,
+            reputation INTEGER DEFAULT 100,
+            optimal_price INTEGER DEFAULT 30,
+            base_visitors INTEGER DEFAULT 30,
+            max_animals INTEGER DEFAULT 5
+        )
+        """)
 
 
 """СОХРАНЕНИЕ ДАННЫХ ИГРОКА"""
 def save_player(user_id, player_data):
 
-    temp_rows = []
-    player_exists = False
+    with get_db() as db:
 
-    with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if int(row['user_id']) == user_id:  #  находим пользователя в бд
-                row.update(player_data)
-                player_exists = True  #  флаг (нашли пользователя)
-            temp_rows.append(row)
+        animals_str = str(player_data['animals'])
 
-    if not player_exists:
-        new_row = {'user_id': user_id}
-        new_row.update(player_data)
-        temp_rows.append(new_row)
-
-
-    with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['user_id'] + list(DEFAULT_PLAYER.keys())
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(temp_rows)
+        db.execute("""
+        INSERT OR REPLACE INTO players 
+        (user_id, money, ticket_price, feed, animals, last_income, 
+         last_fed, warnings, reputation, optimal_price, base_visitors, max_animals)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            player_data['money'],
+            player_data['ticket_price'],
+            player_data['feed'],
+            animals_str,
+            player_data['last_income'],
+            player_data['last_fed'],
+            player_data['warnings'],
+            player_data['reputation'],
+            player_data['optimal_price'],
+            player_data['base_visitors'],
+            player_data['max_animals']
+        ))
 
 
 """ЗАГРУЗКА ДАННЫХ"""
 def load_player(user_id):
 
-    with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if int(row['user_id']) == user_id:  #  находим пользователя по айди
+    with get_db() as db:
+        player = db.execute(
+            "SELECT * FROM players WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
 
-                player_data = {
-                    'money': int(row['money']),
-                    'ticket_price': int(row['ticket_price']),
-                    'feed': int(row['feed']),
-                    'animals': eval(row['animals']),
-                    'last_income': row['last_income'],
-                    'last_fed': row['last_fed'],
-                    'warnings': int(row['warnings']),
-                    'reputation': int(row['reputation']),
-                    'optimal_price': int(row['optimal_price']),
-                    'base_visitors': int(row['base_visitors'])
-                }
-                return player_data
+    if player:
+
+        player_dict = dict(player)
+        player_dict['animals'] = eval(player['animals'])
+        return player_dict
     return None
 
 
 """СПИСОК ВСЕХ ИГРОКОВ"""
 def get_all_players():
 
-    players = {}
-    with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            user_id = int(row['user_id'])
-            players[user_id] = {
-                'money': int(row['money']),
-                'ticket_price': int(row['ticket_price']),
-                'feed': int(row['feed']),
-                'animals': eval(row['animals']),
-                'last_income': row['last_income'],
-                'last_fed': row['last_fed'],
-                'warnings': int(row['warnings']),
-                'reputation': int(row['reputation']),
-                'optimal_price': int(row['optimal_price']),
-                'base_visitors': int(row['base_visitors'])
-            }
-    return players
+    with get_db() as db:
+        players = db.execute("SELECT * FROM players").fetchall()
 
-# создание csv
-init_csv()
+    return {
+        row['user_id']: {
+            **dict(row),
+            'animals': eval(row['animals'])  # Десериализация
+        }
+        for row in players
+    }
+
+# создание db
+init_db()
 
 
 """НАЧАЛО ИГРЫ"""
@@ -252,6 +271,7 @@ async def set_price(update, context):
         )
 
 
+
 """СТАТУС ЗООПАРКА"""
 
 
@@ -269,13 +289,26 @@ async def status(update, context):
     visitors = calculate_visitors(player)
     income = visitors * player['ticket_price']
 
+
     #  ПОСЛЕДНЕЕ КОРМЛЕНИЕ
     last_fed = datetime.fromisoformat(player['last_fed'])
     now = datetime.now()
     time_since_fed = now - last_fed
 
-    hours = time_since_fed.seconds // 3600
+    hours = time_since_fed.total_seconds() // 3600
     minutes = (time_since_fed.seconds % 3600) // 60
+
+    print(f'с последнего кормления прошло {minutes} минут')
+
+
+    #СТАТУС ЖИВОТНЫХ
+    status = []
+    if minutes <= FEEDING_INTERVAL // 60 // 2:
+        status = ['сыты', '🟢']
+    elif minutes > FEEDING_INTERVAL // 60 // 2 and minutes < FEEDING_INTERVAL // 60:
+        status = ['голодны', '🟡']
+    else:
+        status = ['очень голодны', '🔴']
 
     await update.message.reply_text(
         f"🏠 Ваш зоопарк:\n\n"
@@ -286,7 +319,9 @@ async def status(update, context):
         f"💵 Доход/мин: ~{income}\n"
         f"🌾 Корма: {player['feed']}\n\n"
         f"🐾 Ваши животные:\n{animals_list}\n\n"
-        f"⏳ Последнее кормление: {minutes} минут назад"
+        f"⏳ Последнее кормление: {minutes} мин. назад\n"
+        f"{status[-1]} Ваши животные {status[0]}\n\n"
+        f"⚠️ Предупреждения: {player['warnings']}"
     )
 
 
@@ -463,19 +498,23 @@ async def shop_button_handler(update, context):
 
         await query.edit_message_text(
             f"🛒 Вы выбрали: {animal_data['emoji']} {animal_name.capitalize()}\n"
+            f"🐾 У вас имеется {player[animal_name.capitalize()]}/{player['max_animals']}\n\n"
+            f"⭐ Минимальная репутация для покупки: {animal_data['min_rep']}\n"
             f"💵 Цена: {animal_data['price']}$\n"
             f"👥 Привлекает посетителей: +{animal_data['visitor_multiplier']}\n"
             f"🍗 Расход корма: {animal_data['feed_cost']}/день\n\n"
-            f"💰 Ваш баланс: {player['money']}$\n\n"
-            "Введите количество для покупки:",
+            f"💰 Ваш баланс: {player['money']}$\n"
+            f"🌟 Ваша репутация: {player['reputation']}\n\n"
+            
+            "Введите количество для покупки",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↩️ Назад к списку", callback_data='buy_animals')]
             ])
         )
 
 
-    elif query.data == 'confirm_animal':  # подтверждение покупки
-
+    #ПОДТВЕРЖДЕНИЕ ПОКУПКИ ЖИВОТНЫХ
+    elif query.data == 'confirm_animal':
         purchase = context.user_data.get('purchase_data')
 
         if not purchase:
@@ -483,8 +522,39 @@ async def shop_button_handler(update, context):
             return
 
         animal_name = context.user_data['selected_animal']
+        to_buy = player['animals'].get(animal_name, 0) + purchase['quantity'] # сколько животных после покупки
 
-        if player['money'] >= purchase['total_price']:
+        print(f'репутация игрока {player['reputation']}')
+        print(f'необходимая репутация {animals[purchase['animal']]['min_rep']}')
+
+        if player['reputation'] < animals[purchase['animal']]['min_rep']:
+
+            need_rep = animals[purchase['animal']]['min_rep'] - player['reputation']
+            await query.edit_message_text(
+                f"❕ У вашего зоопарка низкая репутация ❕\n\n"
+                f"🌟 Текущая репутация: {player['reputation']}\n"
+                f"⭐ Необходимая репутация: {animals[purchase['animal']]['min_rep']}\n"
+                f"📉 Нужно ещё {need_rep} очков репутации.\n\n"
+                f"📄 Чтобы узнать, как повысить репутацию используйте /reputation"
+
+            )
+            return
+
+
+        elif to_buy >= player['max_animals']: # если достигнут лимит животных
+            available = max([player['max_animals'] - player['animals'][animal_name], 0])
+            emoji = animals[animal_name]['emoji']
+
+            await query.edit_message_text(
+                f"❕ Вы превысили лимит животных ❕\n\n"
+                f"{emoji} У вас: {player['animals'][animal_name]}/{player['max_animals']}\n"
+                f"🛒 Выбрано для покупки: {purchase['quantity']}\n"
+                f"☑️ Доступно для покупки: {available}"
+
+            )
+            return
+
+        if player['money'] >= purchase['total_price']:  # если достаточно денег
             player['money'] -= purchase['total_price']
 
             if animal_name in player['animals']:
@@ -498,19 +568,12 @@ async def shop_button_handler(update, context):
                 f"✅ Покупка завершена!\n\n"
                 f"{animals[animal_name]['emoji']} +{purchase['quantity']} {animal_name.capitalize()}\n"
                 f"💸 -{purchase['total_price']} монет\n"
-                f"💰 Остаток: {player['money']} монет"
+                f"💰 Остаток: {player['money']} монет\n\n"
+                f"🏪 Чтобы продолжить покупки используйте /shop\n"
+                f"🐾 Чтобы просмотреть статус зоопарка используйте /status"
             )
 
-            await asyncio.sleep(1)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="🏪 Чтобы продолжить покупки используйте /shop"
-            )
-            await asyncio.sleep(1)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="🐾 Чтобы просмотреть статус зоопарка используйте /status"
-            )
+
         else:
             need = purchase['total_price'] - player['money']
             await query.edit_message_text(
@@ -562,11 +625,15 @@ async def shop_button_handler(update, context):
         context.user_data['selected_animal'] = animal
         await query.edit_message_text(
             f"🛒 Вы выбрали: {animal_data['emoji']} {animal.capitalize()}\n"
+            f"🐾 У вас имеется: {player['animals'].get(animal, 0)}/{player['max_animals']}\n\n"
+            f"⭐ Минимальная репутация для покупки: {animal_data['min_rep']}\n"
             f"💵 Цена: {animal_data['price']}$\n"
-            f"👥 Привлекает посетителей: +{animal_data['visitor_multiplier']}\n"
+            f"👥 Множитель посещений: +{animal_data['visitor_multiplier']}\n"
             f"🍗 Расход корма: {animal_data['feed_cost']}/день\n\n"
-            f"💰 Ваш баланс: {player['money']}$\n\n"
-            "Введите количество для покупки:",
+            f"💰 Ваш баланс: {player['money']}$\n"
+            f"🌟 Ваша репутация: {player['reputation']}\n\n"
+
+            "Введите количество для покупки",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↩️ Назад к списку", callback_data='buy_animals')]
             ])
@@ -637,7 +704,8 @@ async def handle_input(update, context):
 
             context.user_data['purchase_data'] = {
                 'quantity': quantity,
-                'total_price': total_price
+                'total_price': total_price,
+                'animal': animal_name
             }
 
             await update.message.reply_text(
@@ -652,7 +720,7 @@ async def handle_input(update, context):
             await update.message.reply_text("⚠️ Введите целое число больше 0!")
 
 
-"""КОРМЕЖКА ЖИВОТНЫХ"""
+"""КОРМЛЕНИЕ ЖИВОТНЫХ"""
 
 
 async def feed(update, context):
@@ -676,24 +744,44 @@ async def feed(update, context):
         )
         return
 
+    last_fed = datetime.fromisoformat(player['last_fed'])
+    now = datetime.now()
+    time_since_fed = now - last_fed
+    FEEDING_INTERVAL - time_since_fed.total_seconds()
+
+
+    if time_since_fed.total_seconds() < FEEDING_INTERVAL // 2:  #  если с последнего кормления прошло недостаточно времени
+
+        time_left = (FEEDING_INTERVAL // 2) - time_since_fed.total_seconds()
+        minutes_left = int(time_left // 60)
+
+        await update.message.reply_text(
+            f"🍽️ Ваши животные сыты!\n"
+            f"🌾 Вы сможете покормить их снова через {minutes_left} мин."
+        )
+        return
+
     updated_player = player.copy()
     updated_player['last_fed'] = datetime.now().isoformat()
     updated_player['feed'] -= total_feed_cost
     save_player(user_id, updated_player)
     minutes = FEEDING_INTERVAL // 60
 
+    can_feed = max([minutes - (minutes // 2), 0])
+
     await update.message.reply_text(
         f"🍽️ Животные накормлены!\n"
         f"🌾 Израсходовано корма: {total_feed_cost}\n"
         f"⏰ Последнее кормление: {now.strftime('%H:%M:%S')}\n"
-        f"⚠️ Следующее кормление через {minutes // 60} ч."
+        f"😸 Кормление будет доступно через {can_feed} мин.\n"
+        f"⚠️ Осталось времени до голодания: {minutes} мин."
     )
 
 
 """ПРОВЕРКА ГОЛОДНЫХ ЖИВОТНЫХ"""
 
 
-async def check_hunger(context: ContextTypes.DEFAULT_TYPE):
+async def check_hunger(context):
     now = datetime.now()
     players = get_all_players()
     for user_id, player in players.items():
@@ -702,11 +790,13 @@ async def check_hunger(context: ContextTypes.DEFAULT_TYPE):
         #  предупреждение о проверке
         if FEEDING_INTERVAL < time_since_fed:
             time_left = INSPECTION_INTERVAL - time_since_fed  # время до визита инспектора
+            if time_left <=  0:
+                return
             minutes_left = int(time_left // 60)
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"⚠️ Внимание! Животные голодны!\n"
-                     f"Инспектор придет через {minutes_left} минут\n"
+                     f"Инспектор придет через {minutes_left} мин.\n"
                      f"Срочно покормите животных командой /feed"
             )
 
@@ -725,13 +815,12 @@ async def inspection(context):
         #  ПОСЛЕДНЕЕ КОРМЛЕНИЕ
         last_fed = datetime.fromisoformat(player['last_fed'])
         time_since_fed = (now - last_fed).total_seconds()  #  время с последней кормежки в секундах
-        print(f'Время с последнего кормления {time_since_fed}')
 
-        if time_since_fed < FEEDING_INTERVAL // 2: # если животные давно не ели (в случае с кормежкой раз в 10 минут если до голодания осталось 5 минут)
+        if time_since_fed > FEEDING_INTERVAL // 2: # если животные давно не ели (в случае с кормежкой раз в 10 минут если до голодания осталось 5 минут)
+            print(f'Время с последнего кормления {time_since_fed}')
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"⚠️ВНИМАНИЕ⚠️\n\n"
-                     f"🥩 Ваши животные давно не ели!\n"
+                text=f"🥩 Ваши животные давно не ели!\n"
                      f"👮 Вам следует покормить их перед следующим визитом Инспектора.")
 
 
@@ -755,7 +844,7 @@ async def inspection(context):
                 text=f"{phrase}\n\n"
                      f"⚠️ Получено предупреждений: {player['warnings']}\n"
                      f"📉 Репутация зоопарка: -{rep}\n\n"
-                     f"🌟 Репутация зоопарка: {player['reputation']}\n"
+                     f"🌟 Текущая репутация зоопарка: {player['reputation']}\n"
                      f"🥩 Срочно покормите животных командой /feed")
 
         else:
@@ -772,7 +861,7 @@ async def inspection(context):
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=f"👮 Инспектор посетил ваш зоопарк и остался доволен!\n"
-                         f"🌟 Репутация зоопарка: +{rep}\n"
+                         f"🌟 Текущая репутация зоопарка: +{rep}\n"
                          f"🕐 Следующий визит через {INCOME_TIMER} секунд!\n"
                          f"😸 Продолжайте кормить животных вовремя, чтобы увеличить репутацию зоопарка!")
 
@@ -785,6 +874,32 @@ async def inspection(context):
 
 
         save_player(user_id, player)
+
+
+"""СЛУЧАЙНЫЕ СОБЫТИЯ"""
+async def random_events(context):
+    print('СЛУЧАЙНОЕ СОБЫТИЕ!')
+    players = get_all_players()
+    for user_id, player in players.items():
+        event_name = random.choice(list(EVENTS.keys()))
+        event = EVENTS[event_name]
+        message = ""
+
+
+        if event["type"] in ["money", 'food', 'reputation']:
+            type = event["type"]
+            amount = random.randint(event["min_amount"], event["max_amount"])  # случайное число из диапазона
+            if "amount" in event["message"]:
+                message = event["message"].format(amount=amount)
+                player[type] += amount
+
+
+        if message:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"{event['emoji']} *Событие!* {event['emoji']}\n{message}"
+            )
+            save_player(user_id, player)
 
 
 def main():
@@ -822,6 +937,13 @@ def main():
         inspection,
         interval=INSPECTION_INTERVAL,
         first=0.0
+    )
+
+    # периодические случайные события
+    application.job_queue.run_repeating(
+        random_events,
+        interval=RANDOM_EVENTS_INTERVAL,
+        first=0
     )
 
     application.add_handler(MessageHandler(
