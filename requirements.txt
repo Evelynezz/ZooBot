@@ -1,0 +1,7 @@
+python-telegram-bot==13.0
+asyncio
+telegram
+random
+json
+sqlalchemy
+sqlalchemy.orm
